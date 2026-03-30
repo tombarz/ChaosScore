@@ -8,3 +8,5 @@ h5py
 matplotlib
 einops
 local-attention
+cellxgene-census
+GEOparse

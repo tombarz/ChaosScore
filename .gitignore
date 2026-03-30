@@ -1,1 +1,3 @@
 .venv/
+data/hlca_core.h5ad
+src/__pycache__/download_lung_reference_data.cpython-312.pyc

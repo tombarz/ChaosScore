@@ -10,3 +10,6 @@ einops
 local-attention
 cellxgene-census
 GEOparse
+torch
+tqdm
+pyarrow

@@ -1,0 +1,90 @@
+Absolutely — here is an updated **short-term plan message** reflecting the new, smaller starting point.
+
+---
+
+## Updated Short-Term Plan
+
+Our immediate goal is to start with the simplest possible pilot that is still scientifically meaningful and aligned with the broader project. Rather than beginning with multiple cancer types or both abnormality and ambiguity, we will start with a **single healthy lung reference atlas** and a **single malignant lung dataset**, and focus first on **normalized reconstruction error** as our initial abnormality signal. This is well aligned with the project’s core idea of quantifying abnormality relative to a normal reference using masked-gene reconstruction. 
+
+### Scope of the first pilot
+
+We will use:
+
+* **HLCA** as the healthy lung reference atlas
+* **one malignant lung dataset** as the cancer comparison set
+* **pretrained scFoundation only**, without additional training or fine-tuning in this first step
+
+This design keeps the first experiment narrow and practical while still directly testing the central hypothesis: whether cancer cells appear more abnormal than healthy lung cells when evaluated by reconstruction-based surprisal / normalized reconstruction error. 
+
+### First metric
+
+The first metric we will implement is:
+
+* **Abnormality = normalized reconstruction error of masked genes**
+
+This choice is a natural starting point because scFoundation was pretrained with a masked reconstruction objective over gene expression values, using masked genes and read-depth-aware inputs during pretraining. The model predicts masked gene values from the remaining context, making reconstruction error the most direct zero-shot signal to test first. 
+
+### Immediate objective
+
+The near-term objective is to determine whether the pretrained model assigns a systematically higher normalized reconstruction error to malignant lung cells than to healthy lung cells from HLCA. If this signal is detectable and reasonably robust, it will provide an initial proof of concept for the broader abnormality framework proposed in the project. 
+
+### Practical plan
+
+The work will proceed in a minimal end-to-end pipeline:
+
+1. Load and preprocess the healthy HLCA reference and the malignant lung dataset.
+2. Align both datasets to the gene space expected by scFoundation.
+3. Run the pretrained scFoundation model in inference mode only.
+4. Mask a subset of genes per cell.
+5. Predict masked values with the model.
+6. Compute normalized reconstruction error per cell.
+7. Compare score distributions between healthy and malignant cells.
+8. Check whether the score is confounded by technical variables such as read depth, number of detected genes, or general QC measures.
+
+### Why this is the right starting point
+
+This smaller pilot reduces complexity in several ways:
+
+* only **one tissue context**: lung
+* only **one healthy reference atlas**
+* only **one malignant comparison dataset**
+* only **one score**
+* no classifier head, no entropy, no state atlas yet
+
+That makes it much easier to answer the first foundational question:
+**does reconstruction-based abnormality show a meaningful cancer-vs-normal signal at all?**
+
+### What success would look like
+
+The pilot will be considered successful if:
+
+* the pipeline runs end-to-end on the two lung datasets
+* normalized reconstruction error can be computed reliably per cell
+* malignant cells show a shifted distribution relative to healthy cells
+* the signal is not explained only by technical artifacts
+
+### What comes next if this works
+
+If the first pilot is promising, the next steps would be:
+
+* refine the normalization of reconstruction error
+* test robustness across lung cell types
+* add additional malignant lung datasets
+* only after that, expand to ambiguity / entropy and later to more cancers
+
+---
+
+## High-Level Checklist
+
+* [ ] Prepare HLCA healthy lung reference
+* [ ] Prepare one malignant lung dataset
+* [ ] Harmonize gene symbols / feature space for scFoundation
+* [ ] Run pretrained scFoundation inference only
+* [ ] Implement masked-gene prediction
+* [ ] Compute normalized reconstruction error per cell
+* [ ] Compare healthy vs malignant score distributions
+* [ ] Check correlation with technical covariates
+* [ ] Generate first summary figures
+* [ ] Decide whether the signal is strong enough to justify expansion
+
+If you want, I can also turn this into a more polished **lab-style update email / project note** version.

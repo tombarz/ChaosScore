@@ -1,3 +1,9 @@
 .venv/
-data/hlca_core.h5ad
+data/
 src/__pycache__/download_lung_reference_data.cpython-312.pyc
+src/__pycache__/
+tests/__pycache__/
+external/scFoundation/model/models/*
+!external/scFoundation/model/models/download.txt
+Dockerfile
+docker-compose.yml

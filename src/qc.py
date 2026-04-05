@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import scanpy as sc
 import anndata as ad
+from scipy import sparse
 
 
 # -----------------------------
@@ -33,6 +34,28 @@ def lower_mad_bound(x: np.ndarray, n_mads: float = 3.0) -> float:
     if scale == 0:
         return float("-inf")
     return med - n_mads * scale
+
+
+def count_detected_cells_per_gene(
+    X,
+    cell_mask: np.ndarray | None = None,
+    batch_size: int = 50000,
+) -> np.ndarray:
+    n_obs, n_vars = X.shape
+    if cell_mask is None:
+        indices = np.arange(n_obs)
+    else:
+        indices = np.flatnonzero(np.asarray(cell_mask, dtype=bool))
+
+    counts = np.zeros(n_vars, dtype=np.int64)
+    for start in range(0, len(indices), batch_size):
+        idx = indices[start : start + batch_size]
+        block = X[idx, :]
+        if sparse.issparse(block):
+            counts += np.asarray(block.getnnz(axis=0)).ravel()
+        else:
+            counts += np.asarray((block > 0).sum(axis=0)).ravel()
+    return counts
 
 
 # -----------------------------
@@ -70,7 +93,7 @@ def flag_cells(
     if sample_col is None or sample_col not in obs.columns:
         groups = pd.Series("all", index=obs.index)
     else:
-        groups = obs[sample_col].astype(str).fillna("missing")
+        groups = obs[sample_col].fillna("missing").astype(str)
 
     flags = pd.DataFrame(index=obs.index)
     flags["fail_min_genes"] = obs["n_genes_by_counts"] < min_genes
@@ -139,44 +162,80 @@ def save_basic_plots(adata: ad.AnnData, outdir: Path) -> None:
 # Main
 # -----------------------------
 
+def resolve_qc_counts_adata(adata: ad.AnnData, counts_source: str) -> tuple[ad.AnnData, str]:
+    if counts_source == "auto":
+        counts_source = "raw" if adata.raw is not None else "X"
+
+    if counts_source == "raw":
+        if adata.raw is None:
+            raise ValueError("counts_source=raw requested but adata.raw is missing")
+        qc_adata = adata.raw.to_adata()
+        qc_adata.obs = adata.obs.copy()
+        return qc_adata, "raw"
+
+    if counts_source != "X":
+        raise ValueError("counts_source must be one of {'auto', 'raw', 'X'}")
+    return adata.copy(), "X"
+
+
 def run_qc(
     input_path: str,
     output_dir: str,
     sample_col: str | None = None,
+    counts_source: str = "auto",
     min_genes: int = 200,
     min_cells_per_gene: int = 3,
     max_pct_hb_flag: float = 10.0,
     mad_n: float = 3.0,
+    detection_batch_size: int = 50000,
+    store_counts_layer: bool = False,
+    skip_plots: bool = False,
+    plot_max_cells: int = 100000,
 ) -> None:
     outdir = Path(output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
 
     adata = sc.read(input_path)
-    adata.layers["counts"] = adata.X.copy()
+    qc_adata, counts_source_used = resolve_qc_counts_adata(adata, counts_source)
+    if store_counts_layer:
+        qc_adata.layers["counts"] = qc_adata.X.copy()
 
-    add_qc_metrics(adata)
+    add_qc_metrics(qc_adata)
     flags = flag_cells(
-        adata,
+        qc_adata,
         sample_col=sample_col,
         min_genes=min_genes,
         max_pct_hb_flag=max_pct_hb_flag,
         mad_n=mad_n,
     )
 
+    qc_adata.obs = qc_adata.obs.join(flags)
     adata.obs = adata.obs.join(flags)
-    save_basic_plots(adata, outdir)
+    if not skip_plots:
+        if qc_adata.n_obs > plot_max_cells:
+            rng = np.random.default_rng(0)
+            idx = rng.choice(qc_adata.n_obs, size=plot_max_cells, replace=False)
+            adata_plot = qc_adata[idx].copy()
+        else:
+            adata_plot = qc_adata
+        save_basic_plots(adata_plot, outdir)
 
-    # Gene filter: standard, conservative
-    gene_detected = np.asarray((adata.X > 0).sum(axis=0)).ravel()
+    # Gene filter: computed in row batches on kept cells to reduce peak memory.
+    keep_cell_mask = qc_adata.obs["keep_cell"].to_numpy()
+    gene_detected = count_detected_cells_per_gene(
+        qc_adata.X,
+        cell_mask=keep_cell_mask,
+        batch_size=detection_batch_size,
+    )
     keep_genes = gene_detected >= min_cells_per_gene
 
     # Remove only hard failures by default
-    adata_qc = adata[adata.obs["keep_cell"].values, keep_genes].copy()
+    adata_qc = adata[keep_cell_mask, keep_genes].copy()
 
     adata.obs.to_csv(outdir / "cell_qc_metrics_and_flags.csv")
     pd.DataFrame(
         {
-            "gene": adata.var_names,
+            "gene": qc_adata.var_names,
             "n_cells_by_counts": gene_detected,
             "keep_gene": keep_genes,
         }
@@ -185,12 +244,14 @@ def run_qc(
     summary = pd.Series(
         {
             "cells_input": int(adata.n_obs),
-            "genes_input": int(adata.n_vars),
+            "genes_input": int(qc_adata.n_vars),
             "cells_kept": int(adata_qc.n_obs),
             "genes_kept": int(adata_qc.n_vars),
             "n_fail_min_genes": int(adata.obs["fail_min_genes"].sum()),
             "n_flag_any_soft": int(adata.obs["flag_any_soft"].sum()),
             "sample_col": sample_col if sample_col is not None else "None",
+            "counts_source_requested": counts_source,
+            "counts_source_used": counts_source_used,
             "min_genes": min_genes,
             "min_cells_per_gene": min_cells_per_gene,
             "max_pct_hb_flag": max_pct_hb_flag,
@@ -208,21 +269,31 @@ def run_qc(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Conservative scRNA-seq QC for cancer/plasticity projects")
-    parser.add_argument("--input", required=True, help="Input .h5ad with raw counts in adata.X")
+    parser.add_argument("--input", required=True, help="Input .h5ad with counts in adata.X or adata.raw")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--sample_col", default=None, help="Optional sample/donor column for per-sample MAD flags")
+    parser.add_argument("--counts_source", choices=["auto", "raw", "X"], default="auto", help="Use adata.raw when available to avoid QC on normalized adata.X")
     parser.add_argument("--min_genes", type=int, default=200)
     parser.add_argument("--min_cells_per_gene", type=int, default=3)
     parser.add_argument("--max_pct_hb_flag", type=float, default=10.0)
     parser.add_argument("--mad_n", type=float, default=3.0)
+    parser.add_argument("--detection_batch_size", type=int, default=50000)
+    parser.add_argument("--store_counts_layer", action="store_true", help="Store a full copy of counts in adata.layers['counts'] (memory-heavy)")
+    parser.add_argument("--skip_plots", action="store_true", help="Skip QC plot generation to save memory/time")
+    parser.add_argument("--plot_max_cells", type=int, default=100000, help="Maximum number of cells used for QC plots")
     args = parser.parse_args()
 
     run_qc(
         input_path=args.input,
         output_dir=args.output_dir,
         sample_col=args.sample_col,
+        counts_source=args.counts_source,
         min_genes=args.min_genes,
         min_cells_per_gene=args.min_cells_per_gene,
         max_pct_hb_flag=args.max_pct_hb_flag,
         mad_n=args.mad_n,
+        detection_batch_size=args.detection_batch_size,
+        store_counts_layer=args.store_counts_layer,
+        skip_plots=args.skip_plots,
+        plot_max_cells=args.plot_max_cells,
     )

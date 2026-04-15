@@ -10,24 +10,26 @@ import torch
 from scipy import sparse
 from sklearn.linear_model import HuberRegressor
 
+from src.config import get_project_paths
+
 try:
     from scfoundation_utils import (
+        clear_cuda_memory,
         compute_correlations,
         ensure_parent_dir,
         load_prepared_dataset,
         load_scfoundation_model,
-        resolve_ckpt_path,
         resolve_scfoundation_repo,
         try_write_parquet,
         write_json,
     )
 except ImportError:
     from src.scfoundation_utils import (
+        clear_cuda_memory,
         compute_correlations,
         ensure_parent_dir,
         load_prepared_dataset,
         load_scfoundation_model,
-        resolve_ckpt_path,
         resolve_scfoundation_repo,
         try_write_parquet,
         write_json,
@@ -127,6 +129,18 @@ def score_matrix(
                 decoder_data_padding_labels=decoder_data_padding,
             )
             prediction = prediction[:, : counts.shape[1]].detach().cpu().numpy()
+
+        clear_cuda_memory(
+            tensor_data,
+            tensor_data_raw,
+            encoder_data,
+            encoder_position_gene_ids,
+            encoder_data_padding,
+            encoder_labels,
+            decoder_data,
+            decoder_data_padding,
+            decoder_position_gene_ids,
+        )
 
         squared_error = np.square(prediction - normalized, dtype=np.float32)
         masked_error_sum = (squared_error * source_mask).sum(axis=1, dtype=np.float64)
@@ -230,36 +244,22 @@ def score_datasets(
     random_seed: int,
 ) -> None:
     repo_path = resolve_scfoundation_repo(scfoundation_repo)
-    ckpt_path = resolve_ckpt_path(checkpoint_path, str(repo_path))
-    model, config, get_encoder_decoder_data = load_scfoundation_model(
-        repo_path=repo_path,
-        ckpt_path=ckpt_path,
-        key="gene",
-    )
+    ckpt_path = Path(checkpoint_path).resolve() if checkpoint_path is not None else get_project_paths().scfoundation_checkpoint
+    model = None
+    config = None
+    get_encoder_decoder_data = None
+    try:
+        model, config, get_encoder_decoder_data = load_scfoundation_model(
+            repo_path=repo_path,
+            ckpt_path=ckpt_path,
+            key="gene",
+        )
 
-    reference_counts, reference_obs, reference_var, reference_summary = load_prepared_dataset(reference_prefix)
-    zero_padded_features = reference_var["is_zero_padded_feature"].to_numpy(dtype=bool)
-    reference_name = Path(reference_prefix).stem
-    reference_scores = score_matrix(
-        counts=reference_counts,
-        zero_padded_features=zero_padded_features,
-        model=model,
-        config=config,
-        get_encoder_decoder_data=get_encoder_decoder_data,
-        batch_size=batch_size,
-        mask_fraction=mask_fraction,
-        target_log10_total_count=target_log10_total_count,
-        random_seed=random_seed,
-    )
-    frames = {reference_name: prepare_feature_frame(reference_obs, reference_scores, reference_name)}
-
-    for target_prefix in target_prefixes:
-        counts, obs, var, _ = load_prepared_dataset(target_prefix)
-        if not var["gene_name"].equals(reference_var["gene_name"]):
-            raise ValueError(f"Prepared dataset {target_prefix} does not match the reference gene panel order")
-        dataset_name = Path(target_prefix).stem
-        scores = score_matrix(
-            counts=counts,
+        reference_counts, reference_obs, reference_var, reference_summary = load_prepared_dataset(reference_prefix)
+        zero_padded_features = reference_var["is_zero_padded_feature"].to_numpy(dtype=bool)
+        reference_name = Path(reference_prefix).stem
+        reference_scores = score_matrix(
+            counts=reference_counts,
             zero_padded_features=zero_padded_features,
             model=model,
             config=config,
@@ -269,59 +269,79 @@ def score_datasets(
             target_log10_total_count=target_log10_total_count,
             random_seed=random_seed,
         )
-        frames[dataset_name] = prepare_feature_frame(obs, scores, dataset_name)
+        frames = {reference_name: prepare_feature_frame(reference_obs, reference_scores, reference_name)}
 
-    residualized_frames, residual_diagnostics = residualize_scores(frames[reference_name], frames)
+        for target_prefix in target_prefixes:
+            counts, obs, var, _ = load_prepared_dataset(target_prefix)
+            if not var["gene_name"].equals(reference_var["gene_name"]):
+                raise ValueError(f"Prepared dataset {target_prefix} does not match the reference gene panel order")
+            dataset_name = Path(target_prefix).stem
+            scores = score_matrix(
+                counts=counts,
+                zero_padded_features=zero_padded_features,
+                model=model,
+                config=config,
+                get_encoder_decoder_data=get_encoder_decoder_data,
+                batch_size=batch_size,
+                mask_fraction=mask_fraction,
+                target_log10_total_count=target_log10_total_count,
+                random_seed=random_seed,
+            )
+            frames[dataset_name] = prepare_feature_frame(obs, scores, dataset_name)
 
-    outdir = Path(output_dir)
-    outdir.mkdir(parents=True, exist_ok=True)
+        residualized_frames, residual_diagnostics = residualize_scores(frames[reference_name], frames)
 
-    output_manifest: dict[str, dict[str, str]] = {}
-    correlation_summary: dict[str, dict[str, dict[str, float]]] = {}
-    combined_frames = []
-    for dataset_name, frame in residualized_frames.items():
-        output_manifest[dataset_name] = save_dataset_outputs(outdir, dataset_name, frame)
-        combined_frames.append(frame)
-        correlation_summary[dataset_name] = {
-            "base_error_vs_log10_total_counts_raw": compute_correlations(frame, "base_error", "log10_total_counts_raw"),
-            "base_error_vs_log10_n_genes_by_counts": compute_correlations(frame, "base_error", "log10_n_genes_by_counts"),
-            "depth_residual_error_vs_log10_total_counts_raw": compute_correlations(
-                frame,
-                "depth_residual_error",
-                "log10_total_counts_raw",
-            ),
-            "depth_residual_error_vs_log10_n_genes_by_counts": compute_correlations(
-                frame,
-                "depth_residual_error",
-                "log10_n_genes_by_counts",
-            ),
+        outdir = Path(output_dir)
+        outdir.mkdir(parents=True, exist_ok=True)
+
+        output_manifest: dict[str, dict[str, str]] = {}
+        correlation_summary: dict[str, dict[str, dict[str, float]]] = {}
+        combined_frames = []
+        for dataset_name, frame in residualized_frames.items():
+            output_manifest[dataset_name] = save_dataset_outputs(outdir, dataset_name, frame)
+            combined_frames.append(frame)
+            correlation_summary[dataset_name] = {
+                "base_error_vs_log10_total_counts_raw": compute_correlations(frame, "base_error", "log10_total_counts_raw"),
+                "base_error_vs_log10_n_genes_by_counts": compute_correlations(frame, "base_error", "log10_n_genes_by_counts"),
+                "depth_residual_error_vs_log10_total_counts_raw": compute_correlations(
+                    frame,
+                    "depth_residual_error",
+                    "log10_total_counts_raw",
+                ),
+                "depth_residual_error_vs_log10_n_genes_by_counts": compute_correlations(
+                    frame,
+                    "depth_residual_error",
+                    "log10_n_genes_by_counts",
+                ),
+            }
+
+        combined = pd.concat(combined_frames, axis=0)
+        combined_csv = outdir / "combined_scores.csv.gz"
+        combined.to_csv(combined_csv, index=True, compression="gzip")
+        try_write_parquet(combined.reset_index(), outdir / "combined_scores.parquet")
+        save_diagnostics_plot(outdir, combined)
+
+        summary = {
+            "reference_prefix": str(Path(reference_prefix).resolve()),
+            "target_prefixes": [str(Path(prefix).resolve()) for prefix in target_prefixes],
+            "checkpoint_path": str(ckpt_path),
+            "scfoundation_repo": str(repo_path),
+            "reference_prepare_summary": reference_summary,
+            "mask_fraction": mask_fraction,
+            "target_log10_total_count": target_log10_total_count,
+            "batch_size": batch_size,
+            "random_seed": random_seed,
+            "residualization": residual_diagnostics,
+            "correlation_summary": correlation_summary,
+            "outputs": output_manifest,
         }
+        write_json(outdir / "score_summary.json", summary)
 
-    combined = pd.concat(combined_frames, axis=0)
-    combined_csv = outdir / "combined_scores.csv.gz"
-    combined.to_csv(combined_csv, index=True, compression="gzip")
-    try_write_parquet(combined.reset_index(), outdir / "combined_scores.parquet")
-    save_diagnostics_plot(outdir, combined)
-
-    summary = {
-        "reference_prefix": str(Path(reference_prefix).resolve()),
-        "target_prefixes": [str(Path(prefix).resolve()) for prefix in target_prefixes],
-        "checkpoint_path": str(ckpt_path),
-        "scfoundation_repo": str(repo_path),
-        "reference_prepare_summary": reference_summary,
-        "mask_fraction": mask_fraction,
-        "target_log10_total_count": target_log10_total_count,
-        "batch_size": batch_size,
-        "random_seed": random_seed,
-        "residualization": residual_diagnostics,
-        "correlation_summary": correlation_summary,
-        "outputs": output_manifest,
-    }
-    write_json(outdir / "score_summary.json", summary)
-
-    print("scFoundation abnormality scoring complete")
-    print(f"Summary: {outdir / 'score_summary.json'}")
-    print(f"Combined scores: {combined_csv}")
+        print("scFoundation abnormality scoring complete")
+        print(f"Summary: {outdir / 'score_summary.json'}")
+        print(f"Combined scores: {combined_csv}")
+    finally:
+        clear_cuda_memory(model)
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -1,4 +1,5 @@
 from __future__ import annotations
+"""Prepare raw/count-like AnnData into the canonical scFoundation-aligned prefix format."""
 
 import argparse
 from pathlib import Path
@@ -22,7 +23,6 @@ try:
         resolve_gene_panel_path,
         select_counts_matrix,
         summarize_integer_like_counts,
-        try_write_parquet,
         write_json,
     )
 except ImportError:
@@ -39,7 +39,6 @@ except ImportError:
         resolve_gene_panel_path,
         select_counts_matrix,
         summarize_integer_like_counts,
-        try_write_parquet,
         write_json,
     )
 
@@ -53,6 +52,15 @@ def prepare_scfoundation_input(
     batch_size: int = 20000,
     dataset_role: str | None = None,
 ) -> None:
+    """
+    Align a count matrix to the scFoundation gene panel and write the prepared file bundle.
+
+    The preparation contract is:
+    - collapse duplicate gene symbols
+    - align to the official 19,264-gene scFoundation panel
+    - zero-fill missing panel genes
+    - preserve cell metadata plus a few preparation/QC summaries
+    """
     panel_path = resolve_gene_panel_path(gene_panel_path)
     panel_df = load_gene_panel(panel_path)
     panel_symbols = pd.Index(panel_df["gene_name"])
@@ -71,6 +79,7 @@ def prepare_scfoundation_input(
         panel_detected_genes = np.zeros(adata.n_obs, dtype=np.int32)
         integer_like_flags: list[bool] = []
 
+        # Process cells in batches so preparation stays sparse and memory-safe on large datasets.
         for start in range(0, adata.n_obs, batch_size):
             stop = min(start + batch_size, adata.n_obs)
             block = counts_matrix[start:stop, :]
@@ -91,30 +100,18 @@ def prepare_scfoundation_input(
         obs["source_n_genes_by_counts"] = source_detected_genes
         obs["total_counts_raw"] = panel_total_counts
         obs["n_genes_by_counts"] = panel_detected_genes
-        obs["panel_nonzero_genes"] = panel_detected_genes
         if dataset_role is not None:
             obs["dataset_role"] = dataset_role
 
         var = panel_df.copy()
+        # Gene-level provenance: whether a panel gene existed in the source data or was zero-filled.
         var["source_symbol_present"] = panel_present
         var["is_zero_padded_feature"] = ~panel_present
-
-        gene_coverage = pd.DataFrame(
-            {
-                "gene_name": panel_symbols,
-                "panel_index": np.arange(len(panel_symbols), dtype=np.int32),
-                "source_symbol_present": panel_present,
-                "is_zero_padded_feature": ~panel_present,
-                "detected_cells": np.asarray(aligned_counts.getnnz(axis=0)).ravel().astype(np.int64),
-            }
-        )
 
         ensure_parent_dir(paths.counts_path)
         sparse.save_npz(paths.counts_path, aligned_counts)
         obs.to_csv(paths.obs_csv_path, compression="gzip")
-        wrote_parquet = try_write_parquet(obs, paths.obs_parquet_path)
         var.to_csv(paths.var_path, index=False)
-        gene_coverage.to_csv(paths.gene_coverage_path, index=False)
 
         summary = {
             "input_h5ad": str(Path(input_h5ad).resolve()),
@@ -130,11 +127,9 @@ def prepare_scfoundation_input(
             "panel_missing_genes": int((~panel_present).sum()),
             "counts_integer_like": bool(all(integer_like_flags)),
             "dataset_role": dataset_role,
-            "wrote_obs_parquet": wrote_parquet,
             "output_counts_path": str(paths.counts_path.resolve()),
             "output_obs_csv_path": str(paths.obs_csv_path.resolve()),
             "output_var_path": str(paths.var_path.resolve()),
-            "output_gene_coverage_path": str(paths.gene_coverage_path.resolve()),
             "gene_panel_path": str(panel_path),
         }
         write_json(paths.summary_path, summary)
@@ -143,9 +138,7 @@ def prepare_scfoundation_input(
             {
                 "counts_path": str(paths.counts_path.resolve()),
                 "obs_csv_path": str(paths.obs_csv_path.resolve()),
-                "obs_parquet_path": str(paths.obs_parquet_path.resolve()),
                 "var_path": str(paths.var_path.resolve()),
-                "gene_coverage_path": str(paths.gene_coverage_path.resolve()),
                 "summary_path": str(paths.summary_path.resolve()),
             },
         )

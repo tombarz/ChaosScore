@@ -156,7 +156,7 @@ class PreparedFineTuneBundleTests(unittest.TestCase):
         var.to_csv(self.paths.var_path, index=False)
 
         with self.paths.summary_path.open("w", encoding="utf-8") as handle:
-            json.dump({"counts_source_used": "raw"}, handle)
+            json.dump({"counts_source_used": "raw", "counts_integer_like": True}, handle)
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -179,6 +179,13 @@ class PreparedFineTuneBundleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Expected 19264 aligned genes"):
             load_finetune_data_bundle(prepared_prefix=self.prefix, cell_type_key="cell_type")
 
+    def test_load_finetune_bundle_rejects_non_integer_like_counts(self) -> None:
+        with self.paths.summary_path.open("w", encoding="utf-8") as handle:
+            json.dump({"counts_source_used": "X", "counts_integer_like": False}, handle)
+
+        with self.assertRaisesRegex(ValueError, "raw/count-like integer values"):
+            load_finetune_data_bundle(prepared_prefix=self.prefix, cell_type_key="cell_type")
+
 
 class MaskedTaskUtilityTests(unittest.TestCase):
     def test_masked_loss_metrics_and_score_frame(self) -> None:
@@ -195,9 +202,9 @@ class MaskedTaskUtilityTests(unittest.TestCase):
             valid_mask=valid_mask,
         )
 
-        self.assertAlmostEqual(float(loss), 2.0 / 3.0, places=6)
-        self.assertAlmostEqual(float(mse), 2.0 / 3.0, places=6)
-        self.assertAlmostEqual(float(mae), 2.0 / 3.0, places=6)
+        self.assertAlmostEqual(float(loss), 0.5, places=6)
+        self.assertAlmostEqual(float(mse), 0.5, places=6)
+        self.assertAlmostEqual(float(mae), 0.5, places=6)
         self.assertEqual(frame.loc["c1", "masked_gene_count"], 1)
         self.assertAlmostEqual(frame.loc["c2", "raw_abnormality"], 1.0, places=6)
 

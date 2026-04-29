@@ -12,7 +12,7 @@ def masked_regression_loss(
     *,
     loss_type: str,
 ) -> torch.Tensor:
-    """Compute masked regression loss only on valid masked positions."""
+    """Compute masked regression loss with each cell weighted equally."""
     if loss_type == "mse":
         elementwise = F.mse_loss(predictions, targets, reduction="none")
     elif loss_type == "mae":
@@ -22,7 +22,10 @@ def masked_regression_loss(
     else:
         raise ValueError(f"Unsupported loss_type '{loss_type}'")
     weights = valid_mask.to(predictions.dtype)
-    return (elementwise * weights).sum() / weights.sum().clamp_min(1.0)
+    per_cell_counts = weights.sum(dim=1)
+    per_cell_loss = (elementwise * weights).sum(dim=1) / per_cell_counts.clamp_min(1.0)
+    cell_weights = (per_cell_counts > 0).to(predictions.dtype)
+    return (per_cell_loss * cell_weights).sum() / cell_weights.sum().clamp_min(1.0)
 
 
 def masked_metrics(
@@ -30,10 +33,14 @@ def masked_metrics(
     targets: torch.Tensor,
     valid_mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return masked MSE and masked MAE."""
+    """Return per-cell-averaged masked MSE and masked MAE."""
     weights = valid_mask.to(predictions.dtype)
-    mse = (torch.square(predictions - targets) * weights).sum() / weights.sum().clamp_min(1.0)
-    mae = (torch.abs(predictions - targets) * weights).sum() / weights.sum().clamp_min(1.0)
+    per_cell_counts = weights.sum(dim=1)
+    cell_weights = (per_cell_counts > 0).to(predictions.dtype)
+    per_cell_mse = (torch.square(predictions - targets) * weights).sum(dim=1) / per_cell_counts.clamp_min(1.0)
+    per_cell_mae = (torch.abs(predictions - targets) * weights).sum(dim=1) / per_cell_counts.clamp_min(1.0)
+    mse = (per_cell_mse * cell_weights).sum() / cell_weights.sum().clamp_min(1.0)
+    mae = (per_cell_mae * cell_weights).sum() / cell_weights.sum().clamp_min(1.0)
     return mse, mae
 
 
@@ -45,10 +52,11 @@ def build_score_frame(
     valid_mask: torch.Tensor,
 ) -> pd.DataFrame:
     """Aggregate per-cell raw abnormality and masked error metrics."""
-    per_cell_denominator = valid_mask.sum(dim=1).clamp_min(1)
+    per_cell_masked = valid_mask.sum(dim=1)
+    per_cell_denominator = per_cell_masked.clamp_min(1)
     per_cell_mse = ((torch.square(predictions - targets) * valid_mask).sum(dim=1) / per_cell_denominator).cpu().numpy()
     per_cell_mae = ((torch.abs(predictions - targets) * valid_mask).sum(dim=1) / per_cell_denominator).cpu().numpy()
-    per_cell_masked = per_cell_denominator.cpu().numpy()
+    per_cell_masked = per_cell_masked.cpu().numpy()
     return pd.DataFrame(
         {
             "cell_id": cell_ids,

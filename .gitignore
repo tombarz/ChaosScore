@@ -1,4 +1,5 @@
 .venv/
+.env
 data/
 src/__pycache__/download_lung_reference_data.cpython-312.pyc
 src/__pycache__/
@@ -7,3 +8,4 @@ external/scFoundation/model/models/*
 !external/scFoundation/model/models/download.txt
 Dockerfile
 docker-compose.yml
+.vscode/launch.json

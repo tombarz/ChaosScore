@@ -23,6 +23,7 @@ from src.training import (
     TrainingTask,
     build_split_bundles,
 )
+from src.training.seed import restore_rng_state
 
 
 class TrainingInfrastructureTests(unittest.TestCase):
@@ -86,6 +87,15 @@ class TrainingInfrastructureTests(unittest.TestCase):
         self.assertEqual(metrics, [{"epoch": 1, "train_loss": 1.0}])
         self.assertTrue(torch.allclose(model.weight.detach(), saved_weight))
         self.assertTrue((save_dir / "checkpoints" / "epoch_0001.pt").exists())
+
+    def test_restore_rng_state_accepts_tensor_loaded_on_cuda_device(self) -> None:
+        torch_state = torch.get_rng_state()
+        if torch.cuda.is_available():
+            torch_state = torch_state.to("cuda")
+
+        restore_rng_state({"torch": torch_state})
+
+        self.assertEqual(torch.get_rng_state().device.type, "cpu")
 
     def test_split_helper_preserves_counts_and_rejects_missing_split(self) -> None:
         bundle = FineTuneDataBundle(

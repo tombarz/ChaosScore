@@ -272,22 +272,3 @@ class MaskedGenePredictionTask(TrainingTask):
             "prepared_prefix": str(train_bundle.prepared_prefix),
             "split_metadata": split_metadata,
         }
-
-
-class CellTypeClassificationTask(TrainingTask):
-    task_name = "cell_type_classification"
-
-    def build_dataset(self, bundle: Any) -> Dataset:
-        raise NotImplementedError("Cell type classification task is planned but not implemented yet")
-
-    def build_collator(self, dataset: Dataset, *, phase: str) -> Any:
-        raise NotImplementedError("Cell type classification task is planned but not implemented yet")
-
-    def compute_loss_and_metrics(
-        self,
-        model: torch.nn.Module,
-        batch: dict[str, object],
-        *,
-        device: torch.device,
-    ) -> dict[str, torch.Tensor]:
-        raise NotImplementedError("Cell type classification task is planned but not implemented yet")

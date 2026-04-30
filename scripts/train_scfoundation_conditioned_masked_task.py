@@ -1,25 +1,32 @@
 from __future__ import annotations
 
 import argparse
-import json
-import random
 import sys
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
 import torch
-from torch.utils.data import DataLoader
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.config import get_project_paths
-from src.data import FineTuneDataBundle, MaskedGenePredictionCollator, ScFoundationAlignedDataset, load_finetune_data_bundle
-from src.models import CellTypeConditionedMaskedGenePredictor, ScFoundationEncoderBackbone
-from src.scfoundation_utils import ensure_parent_dir, try_write_parquet, write_json
-from src.tasks import build_score_frame, masked_metrics, masked_regression_loss
+from src.data import load_finetune_data_bundle
+from src.tasks import MaskedGenePredictionConfig, MaskedGenePredictionTask
+from src.training import (
+    CheckpointConfig,
+    CheckpointManager,
+    DataConfig,
+    JsonlRunLogger,
+    LoggingConfig,
+    Trainer,
+    TrainingConfig,
+    build_split_bundles,
+    build_task_dataloaders,
+    save_run_artifacts,
+    set_seed,
+    write_feature_metadata,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,6 +51,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_dir", required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max_cells", type=int, default=None)
+    parser.add_argument(
+        "--split_assignments",
+        default=None,
+        help="Optional CSV/CSV.GZ with cell_id and split columns. When provided, training uses --train_split only.",
+    )
+    parser.add_argument("--train_split", default="train")
+    parser.add_argument(
+        "--eval_splits",
+        nargs="*",
+        default=None,
+        help="Split names to evaluate after each epoch. Defaults to validation when --split_assignments is provided.",
+    )
     parser.add_argument("--pooling", choices=["max", "mean", "max_mean", "attention"], default="max")
     parser.add_argument("--d_type", type=int, default=64)
     parser.add_argument("--d_depth", type=int, default=16)
@@ -54,267 +73,200 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint_path", default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument(
+        "--log_every_batches",
+        type=int,
+        default=100,
+        help="Print and persist a progress event every N batches. Set 0 to disable batch progress logs.",
+    )
+    parser.add_argument(
+        "--checkpoint_every_batches",
+        type=int,
+        default=1000,
+        help=(
+            "Overwrite checkpoints/latest.pt every N training batches. "
+            "Set 0 to disable mid-epoch checkpoints."
+        ),
+    )
+    parser.add_argument(
+        "--save_epoch_checkpoints",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save checkpoints/epoch_XXXX.pt after each completed epoch.",
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        default=None,
+        help="Optional checkpoint path to resume model, optimizer, completed epoch metrics, and RNG state.",
+    )
     return parser.parse_args()
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def move_batch_to_device(batch: dict[str, object], device: torch.device) -> dict[str, object]:
-    out: dict[str, object] = {}
-    for key, value in batch.items():
-        if torch.is_tensor(value):
-            out[key] = value.to(device)
-        else:
-            out[key] = value
-    return out
-
-
-def train_one_epoch(
-    model: CellTypeConditionedMaskedGenePredictor,
-    dataloader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    *,
-    device: torch.device,
-    loss_type: str,
-) -> dict[str, float]:
-    model.train()
-    running_loss = 0.0
-    running_mse = 0.0
-    running_mae = 0.0
-    batches = 0
-
-    for batch in dataloader:
-        batch = move_batch_to_device(batch, device)
-        predictions = model(
-            x_masked=batch["x_masked"],  # type: ignore[arg-type]
-            masked_gene_ids=batch["masked_gene_ids"],  # type: ignore[arg-type]
-            masked_positions_valid=batch["masked_positions_valid"],  # type: ignore[arg-type]
-            cell_type_ids=batch["cell_type_ids"],  # type: ignore[arg-type]
-            depth_features=batch["depth_features"],  # type: ignore[arg-type]
-        )
-        loss = masked_regression_loss(
-            predictions,
-            batch["masked_target_values"],  # type: ignore[arg-type]
-            batch["masked_positions_valid"],  # type: ignore[arg-type]
-            loss_type=loss_type,
-        )
-        mse, mae = masked_metrics(
-            predictions,
-            batch["masked_target_values"],  # type: ignore[arg-type]
-            batch["masked_positions_valid"],  # type: ignore[arg-type]
-        )
-
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
-
-        running_loss += float(loss.detach().cpu())
-        running_mse += float(mse.detach().cpu())
-        running_mae += float(mae.detach().cpu())
-        batches += 1
-
-    return {
-        "loss": running_loss / max(batches, 1),
-        "masked_mse": running_mse / max(batches, 1),
-        "masked_mae": running_mae / max(batches, 1),
-    }
-
-
-def score_dataset(
-    model: CellTypeConditionedMaskedGenePredictor,
-    dataloader: DataLoader,
-    bundle: FineTuneDataBundle,
-    *,
-    device: torch.device,
-) -> pd.DataFrame:
-    model.eval()
-    records: list[pd.DataFrame] = []
-    with torch.no_grad():
-        for batch in dataloader:
-            batch = move_batch_to_device(batch, device)
-            predictions = model(
-                x_masked=batch["x_masked"],  # type: ignore[arg-type]
-                masked_gene_ids=batch["masked_gene_ids"],  # type: ignore[arg-type]
-                masked_positions_valid=batch["masked_positions_valid"],  # type: ignore[arg-type]
-                cell_type_ids=batch["cell_type_ids"],  # type: ignore[arg-type]
-                depth_features=batch["depth_features"],  # type: ignore[arg-type]
-            )
-            frame = build_score_frame(
-                cell_ids=batch["cell_ids"],  # type: ignore[arg-type]
-                predictions=predictions,
-                targets=batch["masked_target_values"],  # type: ignore[arg-type]
-                valid_mask=batch["masked_positions_valid"],  # type: ignore[arg-type]
-            )
-            records.append(frame)
-
-    score_only = pd.concat(records, axis=0)
-    scores = bundle.obs.copy()
-    scores = scores.join(score_only, how="left")
-    scores["cell_type"] = scores["cell_type_label"]
-    scores["dataset"] = scores["dataset_for_task"]
-    scores["batch"] = scores["batch_for_task"]
-    return scores
-
-
-def build_model_and_data(args: argparse.Namespace) -> tuple[CellTypeConditionedMaskedGenePredictor, FineTuneDataBundle]:
-    bundle = load_finetune_data_bundle(
+def build_data_config(args: argparse.Namespace) -> DataConfig:
+    return DataConfig(
         prepared_prefix=args.prepared_prefix,
         cell_type_key=args.cell_type_key,
         total_counts_key=args.total_counts_key,
         batch_key=args.batch_key,
         max_cells=args.max_cells,
+        split_assignments=args.split_assignments,
+        train_split=args.train_split,
+        eval_splits=args.eval_splits,
     )
 
-    backbone = ScFoundationEncoderBackbone(
-        scfoundation_repo=args.scfoundation_repo,
-        checkpoint_path=args.checkpoint_path,
+
+def build_training_config(args: argparse.Namespace) -> TrainingConfig:
+    return TrainingConfig(
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        seed=args.seed,
+        device=args.device,
+        num_workers=args.num_workers,
+    )
+
+
+def build_task_config(args: argparse.Namespace) -> MaskedGenePredictionConfig:
+    return MaskedGenePredictionConfig(
+        mask_ratio=args.mask_ratio,
+        loss_type=args.loss_type,
         freeze_encoder=args.freeze_encoder,
         unfreeze_last_block=args.unfreeze_last_block,
         unfreeze_embeddings=args.unfreeze_embeddings,
+        use_depth_covariate=args.use_depth_covariate,
         pooling=args.pooling,
-        device=args.device,
-    )
-    model = CellTypeConditionedMaskedGenePredictor(
-        backbone=backbone,
-        num_cell_types=len(bundle.cell_type_categories),
-        num_genes=bundle.aligned_counts.shape[1],
         d_type=args.d_type,
         d_depth=args.d_depth,
         d_gene=args.d_gene,
-        hidden_dim=args.head_hidden,
+        head_hidden=args.head_hidden,
         dropout=args.dropout,
-        use_depth_covariate=args.use_depth_covariate,
-    )
-    return model, bundle
-
-
-def save_run_artifacts(
-    *,
-    save_dir: Path,
-    args: argparse.Namespace,
-    bundle: FineTuneDataBundle,
-    epoch_metrics: list[dict[str, float]],
-    scores: pd.DataFrame,
-    model: CellTypeConditionedMaskedGenePredictor,
-) -> None:
-    save_dir.mkdir(parents=True, exist_ok=True)
-
-    feature_metadata_path = save_dir / "feature_metadata.csv"
-    bundle.var.to_csv(feature_metadata_path, index=False)
-
-    scores_path = save_dir / "train_scores.csv.gz"
-    scores.to_csv(scores_path, compression="gzip")
-    try_write_parquet(scores.reset_index(), save_dir / "train_scores.parquet")
-
-    summary = {
-        "prepared_prefix": str(bundle.prepared_prefix),
-        "prepared_summary": bundle.summary,
-        "cell_type_key": args.cell_type_key,
-        "total_counts_key": bundle.total_counts_key_used,
-        "batch_key": args.batch_key,
-        "num_cells": int(bundle.aligned_counts.shape[0]),
-        "num_genes": int(bundle.aligned_counts.shape[1]),
-        "num_cell_types": int(len(bundle.cell_type_categories)),
-        "mask_ratio": float(args.mask_ratio),
-        "loss_type": args.loss_type,
-        "epochs": int(args.epochs),
-        "batch_size": int(args.batch_size),
-        "lr": float(args.lr),
-        "freeze_encoder": bool(args.freeze_encoder),
-        "unfreeze_last_block": bool(args.unfreeze_last_block),
-        "unfreeze_embeddings": bool(args.unfreeze_embeddings),
-        "use_depth_covariate": bool(args.use_depth_covariate),
-        "pooling": args.pooling,
-        "epoch_metrics": epoch_metrics,
-        "cell_type_categories": bundle.cell_type_categories,
-        "checkpoint_path": str(model.backbone.checkpoint_path),
-        "scfoundation_repo": str(model.backbone.repo_path),
-    }
-    write_json(save_dir / "train_metrics.json", summary)
-
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "args": vars(args),
-            "cell_type_categories": bundle.cell_type_categories,
-            "num_genes": int(bundle.aligned_counts.shape[1]),
-            "feature_metadata_path": str(feature_metadata_path.resolve()),
-            "prepared_prefix": str(bundle.prepared_prefix),
-        },
-        ensure_parent_dir(save_dir / "model.pt"),
+        scfoundation_repo=args.scfoundation_repo,
+        checkpoint_path=args.checkpoint_path,
+        device=args.device,
+        seed=args.seed,
     )
 
 
 def main() -> None:
     args = parse_args()
-    set_seed(args.seed)
-    device = torch.device(args.device)
+    args_dict = vars(args)
+    save_dir = Path(args.save_dir)
 
-    model, bundle = build_model_and_data(args)
+    data_config = build_data_config(args)
+    training_config = build_training_config(args)
+    logging_config = LoggingConfig(save_dir=save_dir, log_every_batches=args.log_every_batches)
+    checkpoint_config = CheckpointConfig(
+        save_dir=save_dir,
+        checkpoint_every_batches=args.checkpoint_every_batches,
+        save_epoch_checkpoints=args.save_epoch_checkpoints,
+        resume_from_checkpoint=args.resume_from_checkpoint,
+    )
+    task = MaskedGenePredictionTask(build_task_config(args))
+
+    set_seed(training_config.seed)
+    logger = JsonlRunLogger(
+        logging_config.progress_log_path,
+        append=checkpoint_config.resume_from_checkpoint is not None,
+    )
+    logger.run_start(
+        save_dir=save_dir,
+        command_args=args_dict,
+        resume=checkpoint_config.resume_from_checkpoint is not None,
+    )
+
+    full_bundle = load_finetune_data_bundle(
+        prepared_prefix=data_config.prepared_prefix,
+        cell_type_key=data_config.cell_type_key,
+        total_counts_key=data_config.total_counts_key,
+        batch_key=data_config.batch_key,
+        max_cells=data_config.max_cells,
+    )
+    train_bundle, eval_bundles, split_metadata = build_split_bundles(full_bundle, data_config)
+
+    model = task.build_model(train_bundle)
+    device = torch.device(training_config.device)
     model.to(device)
 
-    dataset = ScFoundationAlignedDataset(bundle)
-    train_collator = MaskedGenePredictionCollator(
-        zero_padded_features=dataset.zero_padded_features,
-        mask_ratio=args.mask_ratio,
-        mask_seed=args.seed,
-    )
-    score_collator = MaskedGenePredictionCollator(
-        zero_padded_features=dataset.zero_padded_features,
-        mask_ratio=args.mask_ratio,
-        mask_seed=args.seed,
-    )
-    train_loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=train_collator,
-    )
-    score_loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=score_collator,
+    feature_metadata_path = write_feature_metadata(save_dir, train_bundle)
+    train_loader, eval_loaders = build_task_dataloaders(
+        task=task,
+        train_bundle=train_bundle,
+        eval_bundles=eval_bundles,
+        batch_size=training_config.batch_size,
+        num_workers=training_config.num_workers,
     )
 
     trainable_params = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if not trainable_params:
         raise ValueError("No trainable parameters found; check freeze/unfreeze flags")
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(trainable_params, lr=training_config.lr, weight_decay=training_config.weight_decay)
 
-    epoch_metrics: list[dict[str, float]] = []
-    for epoch_idx in range(args.epochs):
-        train_collator.set_epoch(epoch_idx)
-        metrics = train_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            device=device,
-            loss_type=args.loss_type,
-        )
-        metrics["epoch"] = epoch_idx + 1
-        epoch_metrics.append(metrics)
-        print(json.dumps(metrics, sort_keys=True))
-
-    scores = score_dataset(model, score_loader, bundle, device=device)
-    save_run_artifacts(
-        save_dir=Path(args.save_dir),
-        args=args,
-        bundle=bundle,
-        epoch_metrics=epoch_metrics,
-        scores=scores,
-        model=model,
+    checkpoint_manager = CheckpointManager(
+        config=checkpoint_config,
+        logger=logger,
+        static_metadata=task.checkpoint_static_metadata(
+            args_dict=args_dict,
+            train_bundle=train_bundle,
+            model=model,
+            feature_metadata_path=feature_metadata_path,
+            split_metadata=split_metadata,
+        ),
+        validate_payload=lambda payload: task.validate_checkpoint(dict(payload), train_bundle),
     )
 
-    print(f"Saved run artifacts to {Path(args.save_dir).resolve()}")
+    start_epoch_idx = 0
+    epoch_metrics: list[dict[str, float]] = []
+    if checkpoint_config.resume_from_checkpoint is not None:
+        start_epoch_idx, epoch_metrics = checkpoint_manager.load(
+            checkpoint_path=checkpoint_config.resume_from_checkpoint,
+            model=model,
+            optimizer=optimizer,
+            device=device,
+        )
+
+    trainer = Trainer(
+        config=training_config,
+        logger=logger,
+        checkpoint_manager=checkpoint_manager,
+    )
+    epoch_metrics = trainer.fit(
+        model=model,
+        optimizer=optimizer,
+        task=task,
+        train_loader=train_loader,
+        eval_loaders=eval_loaders,
+        start_epoch_idx=start_epoch_idx,
+        epoch_metrics=epoch_metrics,
+        log_every_batches=args.log_every_batches,
+        fit_metadata={
+            "split_metadata": split_metadata,
+            "trainable_parameters": int(sum(parameter.numel() for parameter in trainable_params)),
+            "checkpoint_every_batches": int(args.checkpoint_every_batches),
+            "save_epoch_checkpoints": bool(args.save_epoch_checkpoints),
+        },
+    )
+
+    save_run_artifacts(
+        save_dir=save_dir,
+        train_bundle=train_bundle,
+        epoch_metrics=epoch_metrics,
+        model=model,
+        summary_metadata=task.summary_metadata(
+            args_dict=args_dict,
+            train_bundle=train_bundle,
+            model=model,
+            split_metadata=split_metadata,
+            progress_log_path=logging_config.progress_log_path,
+            checkpoint_dir=checkpoint_manager.checkpoint_dir,
+        ),
+        model_metadata=task.final_model_metadata(
+            args_dict=args_dict,
+            train_bundle=train_bundle,
+            split_metadata=split_metadata,
+        ),
+    )
+    logger.run_end(save_dir=save_dir)
 
 
 if __name__ == "__main__":

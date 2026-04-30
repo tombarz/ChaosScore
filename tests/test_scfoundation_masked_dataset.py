@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
-import tempfile
+import shutil
 import unittest
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +15,7 @@ from src.data.scfoundation_masked_dataset import (
     MaskedGenePredictionCollator,
     build_random_mask,
     load_finetune_data_bundle,
+    subset_finetune_data_bundle,
 )
 from src.scfoundation_utils import prepared_dataset_paths
 from src.tasks import build_score_frame, masked_metrics, masked_regression_loss
@@ -122,8 +124,8 @@ class MaskedGenePredictionCollatorTests(unittest.TestCase):
 
 class PreparedFineTuneBundleTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.tmp_path = Path(self.temp_dir.name)
+        self.tmp_path = Path("data") / "processed" / "test_tmp" / f"bundle_{uuid.uuid4().hex}"
+        self.tmp_path.mkdir(parents=True, exist_ok=True)
         self.prefix = self.tmp_path / "prepared" / "toy"
         self.paths = prepared_dataset_paths(self.prefix)
 
@@ -159,7 +161,7 @@ class PreparedFineTuneBundleTests(unittest.TestCase):
             json.dump({"counts_source_used": "raw", "counts_integer_like": True}, handle)
 
     def tearDown(self) -> None:
-        self.temp_dir.cleanup()
+        shutil.rmtree(self.tmp_path, ignore_errors=True)
 
     def test_load_finetune_bundle_from_prepared_prefix(self) -> None:
         bundle = load_finetune_data_bundle(
@@ -173,6 +175,26 @@ class PreparedFineTuneBundleTests(unittest.TestCase):
         self.assertEqual(bundle.cell_type_categories, ["AT1", "AT2"])
         self.assertAlmostEqual(float(bundle.obs.loc["cell_0", "depth_feature"]), np.log10(9.0), places=6)
         self.assertTrue("is_zero_padded_feature" in bundle.var.columns)
+
+    def test_subset_finetune_bundle_preserves_requested_order_and_categories(self) -> None:
+        bundle = load_finetune_data_bundle(
+            prepared_prefix=self.prefix,
+            cell_type_key="cell_type",
+            batch_key="batch",
+        )
+
+        subset = subset_finetune_data_bundle(bundle, ["cell_1", "cell_0"])
+
+        self.assertEqual(subset.obs.index.tolist(), ["cell_1", "cell_0"])
+        self.assertEqual(subset.aligned_counts.shape, (2, 19264))
+        self.assertEqual(subset.cell_type_categories, ["AT1", "AT2"])
+        self.assertEqual(float(subset.aligned_counts[0, 1]), 7.0)
+
+    def test_subset_finetune_bundle_rejects_missing_ids(self) -> None:
+        bundle = load_finetune_data_bundle(prepared_prefix=self.prefix, cell_type_key="cell_type")
+
+        with self.assertRaisesRegex(ValueError, "not present"):
+            subset_finetune_data_bundle(bundle, ["missing_cell"])
 
     def test_load_finetune_bundle_rejects_wrong_gene_count(self) -> None:
         sparse.save_npz(self.paths.counts_path, sparse.csr_matrix((2, 3), dtype=np.float32))

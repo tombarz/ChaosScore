@@ -251,5 +251,11 @@ class ScFoundationEncoderBackbone(nn.Module):
         torch.Tensor
             [B, H] pooled cell embedding.
         """
-        encoded_tokens, padding_mask, _, _ = self._encode_visible_tokens(x_masked)
+        if self.backbone_has_trainable_params:
+            encoded_tokens, padding_mask, _, _ = self._encode_visible_tokens(x_masked)
+        else:
+            with torch.no_grad():
+                encoded_tokens, padding_mask, _, _ = self._encode_visible_tokens(x_masked)
+            encoded_tokens = encoded_tokens.detach()
+            padding_mask = padding_mask.detach()
         return self._pool_encoded_tokens(encoded_tokens, padding_mask)

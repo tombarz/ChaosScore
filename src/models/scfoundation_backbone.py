@@ -255,7 +255,12 @@ class ScFoundationEncoderBackbone(nn.Module):
             encoded_tokens, padding_mask, _, _ = self._encode_visible_tokens(x_masked)
         else:
             with torch.no_grad():
-                encoded_tokens, padding_mask, _, _ = self._encode_visible_tokens(x_masked)
+                fastpath_was_enabled = torch.backends.mha.get_fastpath_enabled()
+                torch.backends.mha.set_fastpath_enabled(False)
+                try:
+                    encoded_tokens, padding_mask, _, _ = self._encode_visible_tokens(x_masked)
+                finally:
+                    torch.backends.mha.set_fastpath_enabled(fastpath_was_enabled)
             encoded_tokens = encoded_tokens.detach()
             padding_mask = padding_mask.detach()
         return self._pool_encoded_tokens(encoded_tokens, padding_mask)

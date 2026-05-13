@@ -39,7 +39,7 @@ python -m src.create_train_val_test_splits \
   --input_h5ad data/lung_data/hlca_core.h5ad \
   --output_dir data/processed/lung/full_hlca_core/splits \
   --stratify_key ann_level_3 \
-  --balance_key donor_id \
+  --holdout_key donor_id \
   --seed 0
 
 echo "Full HLCA preparation finished"

@@ -42,6 +42,34 @@ def build_healthy_mask(
     )
 
 
+def build_exact_risk_mask(
+    obs: pd.DataFrame,
+    *,
+    age_cutoff: float,
+    age_column: str,
+    smoking_column: str,
+    bmi_column: str,
+    disease_column: str,
+    never_smoking_value: str,
+    normal_disease_value: str,
+    bmi_low: float,
+    bmi_high: float,
+) -> pd.Series:
+    age = pd.to_numeric(obs[age_column], errors="coerce")
+    bmi = pd.to_numeric(obs[bmi_column], errors="coerce")
+    smoking = obs[smoking_column].astype("string").str.strip().str.lower()
+    disease = obs[disease_column].astype("string").str.strip().str.lower()
+
+    is_smoking_or_smoked = smoking.notna() & smoking.ne("") & smoking.ne(never_smoking_value.strip().lower())
+    is_abnormal_bmi = bmi.lt(bmi_low) | bmi.ge(bmi_high)
+    return (
+        age.gt(age_cutoff)
+        & is_smoking_or_smoked
+        & is_abnormal_bmi
+        & disease.eq(normal_disease_value.strip().lower())
+    )
+
+
 def write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
@@ -69,6 +97,7 @@ def split_lung_groups(
     normal_disease_value: str = "normal",
     bmi_low: float = 18.5,
     bmi_high: float = 25.0,
+    risk_rule: str = "complement",
 ) -> None:
     input_path = Path(input_h5ad)
     if not input_path.exists():
@@ -77,7 +106,12 @@ def split_lung_groups(
     output_root = Path(output_root)
     age_label = format_age_label(age_cutoff)
     healthy_dir = output_root / f"{age_label}_non_smoking_normal_healthy"
-    risk_dir = output_root / f"older_than_{age_label}_smoked_normal_risk_group"
+    if risk_rule == "complement":
+        risk_dir = output_root / f"older_than_{age_label}_smoked_normal_risk_group"
+    elif risk_rule == "exact":
+        risk_dir = output_root / f"older_than_{age_label}_smoking_abnormal_bmi_normal"
+    else:
+        raise ValueError("risk_rule must be one of {'complement', 'exact'}")
 
     adata = ad.read_h5ad(input_path)
     healthy_mask = build_healthy_mask(
@@ -92,7 +126,26 @@ def split_lung_groups(
         bmi_low=bmi_low,
         bmi_high=bmi_high,
     )
-    risk_mask = ~healthy_mask
+    if risk_rule == "complement":
+        risk_mask = ~healthy_mask
+        risk_selection_rule = "complement of healthy group"
+    else:
+        risk_mask = build_exact_risk_mask(
+            adata.obs,
+            age_cutoff=age_cutoff,
+            age_column=age_column,
+            smoking_column=smoking_column,
+            bmi_column=bmi_column,
+            disease_column=disease_column,
+            never_smoking_value=never_smoking_value,
+            normal_disease_value=normal_disease_value,
+            bmi_low=bmi_low,
+            bmi_high=bmi_high,
+        )
+        risk_selection_rule = (
+            f"age > {age_cutoff}, smoking_status != {never_smoking_value!r}, "
+            f"BMI outside [{bmi_low}, {bmi_high}), disease == {normal_disease_value!r}"
+        )
 
     healthy_adata = adata[healthy_mask.to_numpy()].copy()
     risk_adata = adata[risk_mask.to_numpy()].copy()
@@ -128,7 +181,7 @@ def split_lung_groups(
             "cells": int(risk_adata.n_obs),
             "genes": int(risk_adata.n_vars),
             "input_h5ad": str(input_path.resolve()),
-            "selection_rule": "complement of healthy group",
+            "selection_rule": risk_selection_rule,
             "criteria": criteria,
         },
     )
@@ -153,6 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--normal_disease_value", default="normal")
     parser.add_argument("--bmi_low", type=float, default=18.5)
     parser.add_argument("--bmi_high", type=float, default=25.0)
+    parser.add_argument("--risk_rule", choices=["complement", "exact"], default="complement")
     return parser
 
 
@@ -170,6 +224,7 @@ def main() -> None:
         normal_disease_value=args.normal_disease_value,
         bmi_low=args.bmi_low,
         bmi_high=args.bmi_high,
+        risk_rule=args.risk_rule,
     )
 
 
